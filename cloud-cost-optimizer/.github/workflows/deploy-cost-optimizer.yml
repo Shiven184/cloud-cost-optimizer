@@ -1,0 +1,149 @@
+name: Deploy Cost Optimizer
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'deploy = create stack | destroy = delete stack'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+          - deploy
+          - destroy
+      alert_email:
+        description: 'Email address for cost alerts (required for deploy)'
+        required: false
+        default: ''
+
+jobs:
+
+  deploy:
+    name: Deploy Cost Optimizer
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'deploy'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Get AWS account ID
+        id: account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "Account ID: $ACCOUNT_ID"
+
+      - name: Create S3 bucket for Lambda packages
+        run: |
+          BUCKET="cost-optimizer-lambda-${{ steps.account.outputs.account_id }}"
+          echo "LAMBDA_BUCKET=$BUCKET" >> $GITHUB_ENV
+          aws s3 mb s3://$BUCKET --region ${{ secrets.AWS_REGION }} 2>/dev/null || echo "Bucket already exists"
+
+      - name: Package Lambda functions
+        run: |
+          mkdir -p /tmp/lambda-packages
+          for func in cost_reporter idle_ec2_detector unattached_volume_finder; do
+            echo "Packaging $func..."
+            cd src
+            zip -j /tmp/lambda-packages/${func}.zip ${func}.py
+            cd ..
+          done
+
+      - name: Upload Lambda packages to S3
+        run: |
+          for func in cost_reporter idle_ec2_detector unattached_volume_finder; do
+            aws s3 cp /tmp/lambda-packages/${func}.zip \
+              s3://$LAMBDA_BUCKET/cost-optimizer/${func}.zip \
+              --region ${{ secrets.AWS_REGION }}
+            echo "Uploaded: ${func}.zip"
+          done
+
+      - name: Validate CloudFormation template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://cloudformation/cost-optimizer.yaml
+          echo "Template valid."
+
+      - name: Deploy CloudFormation stack
+        run: |
+          EMAIL="${{ github.event.inputs.alert_email }}"
+          if [ -z "$EMAIL" ]; then
+            EMAIL="${{ secrets.ALERT_EMAIL }}"
+          fi
+          aws cloudformation deploy \
+            --template-file cloudformation/cost-optimizer.yaml \
+            --stack-name cost-optimizer \
+            --region ${{ secrets.AWS_REGION }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              AlertEmail="$EMAIL" \
+              MonthlyBudgetThreshold=50 \
+              IdleCPUThreshold=5 \
+              LambdaBucket=$LAMBDA_BUCKET \
+            --no-fail-on-empty-changeset
+
+      - name: Print outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name cost-optimizer \
+            --region ${{ secrets.AWS_REGION }} \
+            --query "Stacks[0].Outputs" \
+            --output table
+          echo ""
+          echo "IMPORTANT: Check your email and click Confirm subscription"
+          echo "in the AWS SNS email. You will not receive alerts until confirmed."
+
+      - name: Test all Lambda functions
+        run: |
+          for func in cost-reporter idle-ec2-detector unattached-volumes; do
+            echo "Testing cost-optimizer-$func..."
+            aws lambda invoke \
+              --function-name cost-optimizer-$func \
+              --region ${{ secrets.AWS_REGION }} \
+              /tmp/${func}-output.json
+            cat /tmp/${func}-output.json
+            echo ""
+          done
+
+  destroy:
+    name: Destroy Cost Optimizer
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'destroy'
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Empty and delete Lambda bucket
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="cost-optimizer-lambda-${ACCOUNT_ID}"
+          aws s3 rm s3://$BUCKET --recursive || true
+          aws s3 rb s3://$BUCKET || true
+
+      - name: Delete CloudFormation stack
+        run: |
+          aws cloudformation delete-stack \
+            --stack-name cost-optimizer \
+            --region ${{ secrets.AWS_REGION }}
+          aws cloudformation wait stack-delete-complete \
+            --stack-name cost-optimizer \
+            --region ${{ secrets.AWS_REGION }}
+          echo "Stack deleted."

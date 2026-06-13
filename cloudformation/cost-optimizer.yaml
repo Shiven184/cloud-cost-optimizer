@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Project 6 - Cloud Cost Optimizer (Lambda + SNS + EventBridge + Budgets)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cost-optimizer
+
+  AlertEmail:
+    Type: String
+    Description: Email address to receive cost alerts
+
+  MonthlyBudgetThreshold:
+    Type: Number
+    Default: 50
+    Description: Monthly spend limit in USD
+
+  IdleCPUThreshold:
+    Type: Number
+    Default: 5
+    Description: CPU percent below which EC2 is considered idle
+
+  LambdaBucket:
+    Type: String
+    Description: S3 bucket where Lambda zip files are stored
+
+Resources:
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${ProjectName}-monthly-budget'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetThreshold
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertTopic
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertTopic
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 110
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref AlertTopic
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CostOptimizerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeVolumes
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetCostForecast
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}'
+      RetentionInDays: 14
+
+  CostReporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-cost-reporter'
+      Runtime: python3.12
+      Handler: cost_reporter.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 120
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref LambdaBucket
+        S3Key: !Sub '${ProjectName}/cost_reporter.zip'
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN:    !Ref AlertTopic
+          BUDGET_THRESHOLD: !Sub '${MonthlyBudgetThreshold}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CostReporterSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-cost-report'
+      Description: Daily cost report at 8 AM IST
+      ScheduleExpression: 'cron(30 2 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: CostReporterTarget
+          Arn: !GetAtt CostReporterFunction.Arn
+
+  CostReporterPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostReporterFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostReporterSchedule.Arn
+
+  IdleEC2DetectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-idle-ec2-detector'
+      Runtime: python3.12
+      Handler: idle_ec2_detector.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref LambdaBucket
+        S3Key: !Sub '${ProjectName}/idle_ec2_detector.zip'
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN:     !Ref AlertTopic
+          CPU_THRESHOLD:     !Sub '${IdleCPUThreshold}'
+          AUTO_STOP_ENABLED: 'false'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  IdleEC2Schedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-idle-ec2-check'
+      Description: Check idle EC2 daily at 9 AM IST
+      ScheduleExpression: 'cron(30 3 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: IdleEC2DetectorTarget
+          Arn: !GetAtt IdleEC2DetectorFunction.Arn
+
+  IdleEC2Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdleEC2DetectorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IdleEC2Schedule.Arn
+
+  UnattachedVolumeFinderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-unattached-volumes'
+      Runtime: python3.12
+      Handler: unattached_volume_finder.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref LambdaBucket
+        S3Key: !Sub '${ProjectName}/unattached_volume_finder.zip'
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  UnattachedVolumeSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-weekly-volume-check'
+      Description: Check unattached EBS volumes every Monday at 9 AM IST
+      ScheduleExpression: 'cron(30 3 ? * MON *)'
+      State: ENABLED
+      Targets:
+        - Id: UnattachedVolumeFinderTarget
+          Arn: !GetAtt UnattachedVolumeFinderFunction.Arn
+
+  UnattachedVolumePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UnattachedVolumeFinderFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UnattachedVolumeSchedule.Arn
+
+Outputs:
+  SNSTopicArn:
+    Value: !Ref AlertTopic
+    Description: Check your email and confirm the SNS subscription
+
+  CostReporterFunction:
+    Value: !Ref CostReporterFunction
+
+  IdleEC2DetectorFunction:
+    Value: !Ref IdleEC2DetectorFunction
+
+  UnattachedVolumeFinderFunction:
+    Value: !Ref UnattachedVolumeFinderFunction
+
+  MonthlyBudget:
+    Value: !Sub '$${MonthlyBudgetThreshold} USD/month'
